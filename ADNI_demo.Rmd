@@ -1,0 +1,259 @@
+# load libraries
+
+```{r message=FALSE, warning=FALSE}
+library(plyr)
+library(dplyr)
+library(lme4)
+library(lmerTest)
+library(tibble)
+library(psych)
+library(corrplot)
+library(ggplot2)
+library(ggpubr)
+library(ggsci)
+library(ggbeeswarm)
+
+```
+
+# read in ADNI data
+
+```{r}
+ADNI <- read.csv("ADNI_ADWB_selection.csv")
+```
+
+# read in connectivity matrix
+
+```{r}
+connectivity = as.matrix(read.csv("Schaefer2018_200Parcels_17Networks_CN_AbTauNeg_Siemens.csv") %>% 
+  select(paste0("V", 1:200)))
+# set diagonal to NA
+diag(connectivity) = NA
+
+# eliminate upper triangle
+lower_triangle = lower.tri(connectivity)
+connectivity_lower_ti = connectivity
+connectivity_lower_ti[lower_triangle] = NA
+
+# plot connectivity
+print(
+  corrplot(
+  connectivity,
+  method = "color", is.corr = F, tl.pos = "n", diag = F,
+  title = "functional connectivity", mar=c(0,0,2,0),
+  type = "lower"
+))
+
+```
+
+# compute PET and cognitive change rates
+
+```{r message=FALSE, warning=FALSE}
+
+ROIs = c("MMSE", "centiloid", "tau.SUVR.DK.temporal_meta", paste0("tau.SUVR.Schaefer200.ROI.idx.", 1:200))
+
+for (i in 1:length(ROIs)){
+  # run lmer
+  current.eq = paste0(ROIs[i], " ~ tau_fup_yrs + (1 + tau_fup_yrs | ID)")
+  tmp.lmer = 
+    lmer(data = ADNI, formula = current.eq)
+  
+  # Extract the change rate coefficients per subject
+  coefficients_ID <- coef(tmp.lmer)$ID
+  
+  # Add ID as a column and rename tau_fup_yrs
+  coefficients_ID <- coefficients_ID %>%
+    rownames_to_column(var = "ID") %>%
+    select(ID, tau_fup_yrs) %>%
+    rename(!!paste0(ROIs[i], ".ROC") := tau_fup_yrs)
+  
+  # merge data frames
+  if (i == 1) {
+    ADNI.ROC = ADNI %>% 
+      filter(tau_fup_yrs == 0) %>% 
+      left_join(coefficients_ID, by = "ID")}
+  
+  if (i > 1) {
+    ADNI.ROC = ADNI.ROC %>% 
+      left_join(coefficients_ID, by = "ID")}
+  
+}
+
+```
+
+## Sanity check: Association between amyloid and tau accumulation
+
+```{r}
+
+sanity.plot = 
+  ADNI.ROC %>% 
+  ggplot(
+    aes(
+      x = centiloid,
+      y = tau.SUVR.DK.temporal_meta.ROC
+    )
+  ) + 
+  geom_smooth(method = "lm") + 
+  geom_point(alpha = 0.5, aes(colour = DX_AB)) + 
+  stat_cor() + 
+  theme_minimal() + 
+  scale_color_jama() + 
+  xlab("Centiloid") + 
+  ylab("Tau-PET rate of change\nTemporal meta ROI") + 
+  labs(colour = "Diagnosis") + 
+  theme(legend.position = "bottom")
+print(sanity.plot)
+
+```
+
+# compute covariance in tau accumulation
+
+```{r}
+# extract tau rates of change
+tau.ROC = ADNI.ROC %>% 
+  filter(amyloid_status == "Ab.pos") %>% 
+  select(paste0("tau.SUVR.Schaefer200.ROI.idx.", 1:200, ".ROC"))
+
+# determine covariance in tau accumulation
+tau.covariance = fisherz(cor(tau.ROC))
+diag(tau.covariance) = NA
+print(
+  corrplot(
+  tau.covariance,
+  method = "color",
+  is.corr = F,
+  tl.pos = "n",
+  diag = F,
+  title = "Covariance in tau accumulation", mar=c(0,0,2,0),
+  type = "upper"
+))
+
+
+```
+
+# determine association between connectivity and covariance in tau accumulation
+
+```{r}
+tmp.plot = 
+  data.frame(
+    tau.covariance = as.numeric(tau.covariance), 
+    connectivity = as.numeric(connectivity_lower_ti)) %>% 
+  filter(!is.na(connectivity)) %>% 
+  ggplot(
+    aes(
+      x = connectivity,
+      y = tau.covariance
+    )
+  ) + 
+  geom_point(alpha = 0.1) + geom_smooth(method = "lm") + 
+  theme_minimal() + stat_cor() + 
+  xlab("functional connectivity") + 
+  ylab("covariance in tau accumulation")
+
+print(tmp.plot)
+
+```
+
+# assess epicenter-based tau spreading
+
+## Group Level
+
+```{r}
+# determine percentage of regions defined as epicenters
+epicenter_prct = 0.05
+
+# create group-average tau-PET data
+epicenter_BL = list()
+
+epicenter_BL$tau.BL.average =
+  colMeans(
+    ADNI.ROC %>%
+      filter(amyloid_status == "Ab.pos") %>%
+      select(paste0("tau.SUVR.Schaefer200.ROI.idx.", 1:200)))
+
+epicenter_BL$tau.ROC.average =
+  colMeans(
+    ADNI.ROC %>%
+      filter(amyloid_status == "Ab.pos") %>%
+      select(paste0("tau.SUVR.Schaefer200.ROI.idx.", 1:200, ".ROC")))
+
+epicenter_BL$epicenter_idx = which(ntile(epicenter_BL$tau.BL.average, I(200*epicenter_prct)) == I(200*epicenter_prct))
+epicenter_BL$epicenter_bin = as.numeric(ntile(epicenter_BL$tau.BL.average, I(200*epicenter_prct)) == I(200*epicenter_prct))
+epicenter_BL$epicenter_connectivity = colMeans(connectivity[epicenter_BL$epicenter_idx, ], na.rm = T)
+
+
+tmp.plot.epicenter =
+  data.frame(
+    tau.ROC = epicenter_BL$tau.ROC.average,
+    epicenter_connectivity = epicenter_BL$epicenter_connectivity,
+    epicenters = epicenter_BL$epicenter_bin
+  ) %>% 
+  filter(epicenters == 0) %>% 
+  ggplot(
+    aes(
+      x = epicenter_connectivity,
+      y = tau.ROC
+    )
+  ) + 
+  geom_point() +  geom_smooth(method = "lm") + 
+  theme_minimal() + stat_cor()
+  
+print(tmp.plot.epicenter)
+
+```
+
+## Q-stage
+
+```{r}
+# define Qstage function
+Qstage <- function(tau.BL, tau.ROC, connectivity, epicenter.prct, distance){
+  diag(connectivity) = NA
+  
+  # determine epicenter ntile
+  epicenter.ntile = 1/epicenter.prct
+  epicenter = which(ntile(tau.BL, epicenter.ntile) == epicenter.ntile)
+  epicenter.tau = mean(tau.BL[epicenter])
+  
+  # determine epicenter connectivity
+  epicenter.connectivity = as.numeric(colMeans(connectivity[epicenter, ], na.rm = T))
+  epicenter.connectivity[epicenter] = NA
+  
+  if(distance == TRUE){Qstage = paste0("Q", ntile(epicenter.connectivity, 4))}
+  if(distance == FALSE){Qstage = paste0("Q", ntile(-epicenter.connectivity, 4))}
+  
+  Qstage[Qstage == "QNA"] <-  "epicenter"
+  
+  # summarize Q ROIs
+  tmp.summary = data.frame(tau.ROC, tau.BL, Qstage) %>%
+    group_by(Qstage) %>% summarize(tau.ROC = mean(tau.ROC), tau.BL = mean(tau.BL))
+  return(tmp.summary)
+}
+
+
+# determine Qstage tau ROC
+q.stage.results = data.frame(ID = ADNI.ROC$ID, Q1.ROC = NA, Q2.ROC = NA, Q3.ROC = NA, Q4.ROC = NA)
+
+for (i in 1:nrow(ADNI.ROC)){
+  current.tau.BL = as.numeric(ADNI.ROC[i,paste0("tau.SUVR.Schaefer200.ROI.idx.", 1:200)])
+  current.tau.ROC = as.numeric(ADNI.ROC[i,paste0("tau.SUVR.Schaefer200.ROI.idx.", 1:200, ".ROC")])
+
+  current.Qstage = 
+    Qstage(
+      tau.BL = current.tau.BL, tau.ROC = current.tau.ROC,
+      connectivity = connectivity, distance = F, epicenter.prct = epicenter_prct
+    )
+  
+ current.Qstage$ID = ADNI.ROC$ID[i]
+ current.Qstage$DX_AB = ADNI.ROC$DX_AB[i]
+ current.Qstage$amyloid_status = ADNI.ROC$amyloid_status[i]
+
+ if(i == 1){Qstage.long_format = current.Qstage}
+ if(i > 1){Qstage.long_format = rbind(Qstage.long_format, current.Qstage)}
+}
+
+Qstage.plot = Qstage.long_format %>%  filter(Qstage != "epicenter") %>% 
+  ggplot( aes( x = Qstage, y = tau.ROC)) + 
+  geom_boxplot(outlier.shape = NA) + theme_minimal() + 
+  stat_compare_means() + geom_beeswarm(alpha = 0.4, colour = "steelblue2") + 
+  facet_wrap(~amyloid_status)
+print(Qstage.plot)
+```
